@@ -15,13 +15,13 @@ import (
 	"io/ioutil"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/cenkalti/backoff/v4"
-	apierrors "github.com/go-openapi/errors"
 	"github.com/pkg/errors"
 	"github.com/rsc/goversion/version"
 	"github.com/sirupsen/logrus"
@@ -32,8 +32,9 @@ import (
 )
 
 const (
-	jsRuntime = "js"
-	goRuntime = "go"
+	jsRuntime    = "js"
+	goRuntime    = "go"
+	amazonLinux2 = "provided.al2"
 
 	preProcessingTimeout = time.Minute * 5
 
@@ -43,6 +44,7 @@ const (
 	lfsVersionString = "version https://git-lfs.github.com/spec/v1"
 
 	edgeFunctionsInternalPath = ".netlify/internal/edge-functions/"
+	edgeRedirectsInternalPath = ".netlify/deploy-config/"
 )
 
 var installDirs = []string{"node_modules/", "bower_components/"}
@@ -78,15 +80,18 @@ type DeployOptions struct {
 	Dir               string
 	FunctionsDir      string
 	EdgeFunctionsDir  string
+	EdgeRedirectsDir  string
 	BuildDir          string
 	LargeMediaEnabled bool
 
-	IsDraft bool
+	IsDraft   bool
+	SkipRetry bool
 
 	Title             string
 	Branch            string
 	CommitRef         string
 	Framework         string
+	FrameworkVersion  string
 	UploadTimeout     time.Duration
 	PreProcessTimeout time.Duration
 
@@ -95,6 +100,12 @@ type DeployOptions struct {
 	files             *deployFiles
 	functions         *deployFiles
 	functionSchedules []*models.FunctionSchedule
+	functionsConfig   map[string]models.FunctionConfig
+}
+
+type deployApiError interface {
+	error
+	Code() int
 }
 
 type uploadError struct {
@@ -103,14 +114,20 @@ type uploadError struct {
 }
 
 type FileBundle struct {
-	Name    string
-	Sum     string
-	Runtime string
-	Size    *int64 `json:"size,omitempty"`
+	Name             string
+	Sum              string
+	Runtime          string
+	Size             *int64 `json:"size,omitempty"`
+	FunctionMetadata *FunctionMetadata
 
 	// Path OR Buffer should be populated
 	Path   string
 	Buffer io.ReadSeeker
+}
+
+type FunctionMetadata struct {
+	InvocationMode string
+	Timeout        int64
 }
 
 type toolchainSpec struct {
@@ -193,10 +210,6 @@ func (n *Netlify) DoDeploy(ctx context.Context, options *DeployOptions, deploy *
 	}
 
 	largeMediaEnabled := options.LargeMediaEnabled
-	if !largeMediaEnabled && deploy != nil {
-		largeMediaEnabled = deploy.SiteCapabilities.LargeMediaEnabled
-	}
-
 	ignoreInstallDirs := options.Dir == options.BuildDir
 
 	context.GetLogger(ctx).Infof("Getting files info with large media flag: %v", largeMediaEnabled)
@@ -214,7 +227,17 @@ func (n *Netlify) DoDeploy(ctx context.Context, options *DeployOptions, deploy *
 	}
 
 	if options.EdgeFunctionsDir != "" {
-		err = addEdgeFunctionsToDeployFiles(options.EdgeFunctionsDir, files, options.Observer)
+		err = addInternalFilesToDeploy(options.EdgeFunctionsDir, edgeFunctionsInternalPath, files, options.Observer)
+		if err != nil {
+			if options.Observer != nil {
+				options.Observer.OnFailedWalk()
+			}
+			return nil, err
+		}
+	}
+
+	if options.EdgeRedirectsDir != "" {
+		err = addInternalFilesToDeploy(options.EdgeRedirectsDir, edgeRedirectsInternalPath, files, options.Observer)
 		if err != nil {
 			if options.Observer != nil {
 				options.Observer.OnFailedWalk()
@@ -225,7 +248,7 @@ func (n *Netlify) DoDeploy(ctx context.Context, options *DeployOptions, deploy *
 
 	options.files = files
 
-	functions, schedules, err := bundle(ctx, options.FunctionsDir, options.Observer)
+	functions, schedules, functionsConfig, err := bundle(ctx, options.FunctionsDir, options.Observer)
 	if err != nil {
 		if options.Observer != nil {
 			options.Observer.OnFailedWalk()
@@ -234,12 +257,14 @@ func (n *Netlify) DoDeploy(ctx context.Context, options *DeployOptions, deploy *
 	}
 	options.functions = functions
 	options.functionSchedules = schedules
+	options.functionsConfig = functionsConfig
 
 	deployFiles := &models.DeployFiles{
-		Files:     options.files.Sums,
-		Draft:     options.IsDraft,
-		Async:     n.overCommitted(options.files),
-		Framework: options.Framework,
+		Files:            options.files.Sums,
+		Draft:            options.IsDraft,
+		Async:            n.overCommitted(options.files),
+		Framework:        options.Framework,
+		FrameworkVersion: options.FrameworkVersion,
 	}
 	if options.functions != nil {
 		deployFiles.Functions = options.functions.Sums
@@ -253,6 +278,10 @@ func (n *Netlify) DoDeploy(ctx context.Context, options *DeployOptions, deploy *
 
 	if len(schedules) > 0 {
 		deployFiles.FunctionSchedules = schedules
+	}
+
+	if options.functionsConfig != nil {
+		deployFiles.FunctionsConfig = options.functionsConfig
 	}
 
 	l := context.GetLogger(ctx)
@@ -321,12 +350,14 @@ func (n *Netlify) DoDeploy(ctx context.Context, options *DeployOptions, deploy *
 		return deploy, nil
 	}
 
-	if err := n.uploadFiles(ctx, deploy, options.files, options.Observer, fileUpload, options.UploadTimeout); err != nil {
+	skipRetry := options.SkipRetry
+
+	if err := n.uploadFiles(ctx, deploy, options.files, options.Observer, fileUpload, options.UploadTimeout, skipRetry); err != nil {
 		return nil, err
 	}
 
 	if options.functions != nil {
-		if err := n.uploadFiles(ctx, deploy, options.functions, options.Observer, functionUpload, options.UploadTimeout); err != nil {
+		if err := n.uploadFiles(ctx, deploy, options.functions, options.Observer, functionUpload, options.UploadTimeout, skipRetry); err != nil {
 			return nil, err
 		}
 	}
@@ -373,16 +404,20 @@ func (n *Netlify) WaitUntilDeployReady(ctx context.Context, d *models.Deploy) (*
 	return n.waitForState(ctx, d, "prepared", "ready")
 }
 
-// WaitUntilDeployLive blocks until the deploy is in the "ready" state. At this point, the deploy is ready to recieve traffic.
+// WaitUntilDeployLive blocks until the deploy is in the "ready" state. At this point, the deploy is ready to receive traffic to all of its URLs.
 func (n *Netlify) WaitUntilDeployLive(ctx context.Context, d *models.Deploy) (*models.Deploy, error) {
 	return n.waitForState(ctx, d, "ready")
 }
 
-func (n *Netlify) uploadFiles(ctx context.Context, d *models.Deploy, files *deployFiles, observer DeployObserver, t uploadType, timeout time.Duration) error {
+// WaitUntilDeployProcessed blocks until the deploy is in the "processed" state. At this point, the deploy is ready to receive traffic via its permalink.
+func (n *Netlify) WaitUntilDeployProcessed(ctx context.Context, d *models.Deploy) (*models.Deploy, error) {
+	return n.waitForState(ctx, d, "processed")
+}
+
+func (n *Netlify) uploadFiles(ctx context.Context, d *models.Deploy, files *deployFiles, observer DeployObserver, t uploadType, timeout time.Duration, skipRetry bool) error {
 	sharedErr := &uploadError{err: nil, mutex: &sync.Mutex{}}
 	sem := make(chan int, n.uploadLimit)
 	wg := &sync.WaitGroup{}
-	defer wg.Wait()
 
 	var required []string
 	switch t {
@@ -395,9 +430,7 @@ func (n *Netlify) uploadFiles(ctx context.Context, d *models.Deploy, files *depl
 	count := 0
 	for _, sha := range required {
 		if files, exist := files.Hashed[sha]; exist {
-			for range files {
-				count++
-			}
+			count += len(files)
 		}
 	}
 
@@ -406,23 +439,32 @@ func (n *Netlify) uploadFiles(ctx context.Context, d *models.Deploy, files *depl
 
 	for _, sha := range required {
 		if files, exist := files.Hashed[sha]; exist {
-			for _, file := range files {
-				select {
-				case sem <- 1:
-					wg.Add(1)
-					go n.uploadFile(ctx, d, file, observer, t, timeout, wg, sem, sharedErr)
-				case <-ctx.Done():
-					log.Info("Context terminated, aborting file upload")
-					return errors.Wrap(ctx.Err(), "aborted file upload early")
+			file := files[0]
+
+			select {
+			case sem <- 1:
+				wg.Add(1)
+				go n.uploadFile(ctx, d, file, observer, t, timeout, wg, sem, sharedErr, skipRetry)
+			case <-ctx.Done():
+				log.Info("Context terminated, aborting file upload")
+				return errors.Wrap(ctx.Err(), "aborted file upload early")
+			}
+
+			if len(files) > 1 {
+				skippedFiles := files[1:]
+				for _, file := range skippedFiles {
+					log.Infof("Skipping file with content already uploaded: %s", file.Name)
 				}
 			}
 		}
 	}
 
+	wg.Wait()
+
 	return sharedErr.err
 }
 
-func (n *Netlify) uploadFile(ctx context.Context, d *models.Deploy, f *FileBundle, c DeployObserver, t uploadType, timeout time.Duration, wg *sync.WaitGroup, sem chan int, sharedErr *uploadError) {
+func (n *Netlify) uploadFile(ctx context.Context, d *models.Deploy, f *FileBundle, c DeployObserver, t uploadType, timeout time.Duration, wg *sync.WaitGroup, sem chan int, sharedErr *uploadError, skipRetry bool) {
 	defer func() {
 		wg.Done()
 		<-sem
@@ -441,6 +483,7 @@ func (n *Netlify) uploadFile(ctx context.Context, d *models.Deploy, f *FileBundl
 		"deploy_id": d.ID,
 		"file_path": f.Name,
 		"file_sum":  f.Sum,
+		"file_size": f.Size,
 	}).Debug("Uploading file")
 
 	b := backoff.NewExponentialBackOff()
@@ -492,8 +535,13 @@ func (n *Netlify) uploadFile(ctx context.Context, d *models.Deploy, f *FileBundl
 				params = params.WithXNfRetryCount(&retryCount)
 			}
 
+			if f.FunctionMetadata != nil {
+				params = params.WithInvocationMode(&f.FunctionMetadata.InvocationMode)
+				params = params.WithTimeout(&f.FunctionMetadata.Timeout)
+			}
+
 			if timeout != 0 {
-				params.SetTimeout(timeout)
+				params.SetRequestTimeout(timeout)
 			}
 			_, operationError = n.Operations.UploadDeployFunction(params, authInfo)
 			if operationError != nil {
@@ -503,12 +551,18 @@ func (n *Netlify) uploadFile(ctx context.Context, d *models.Deploy, f *FileBundl
 
 		if operationError != nil {
 			context.GetLogger(ctx).WithError(operationError).Errorf("Failed to upload file %v", f.Name)
-			apiErr, ok := operationError.(apierrors.Error)
+			apiErr, ok := operationError.(deployApiError)
 
-			if ok && apiErr.Code() == 401 {
-				sharedErr.mutex.Lock()
-				sharedErr.err = operationError
-				sharedErr.mutex.Unlock()
+			if ok {
+				if apiErr.Code() == 401 {
+					sharedErr.mutex.Lock()
+					sharedErr.err = operationError
+					sharedErr.mutex.Unlock()
+				}
+
+				if skipRetry && (apiErr.Code() == 400 || apiErr.Code() == 422) {
+					operationError = backoff.Permanent(operationError)
+				}
 			}
 		}
 
@@ -618,7 +672,7 @@ func walk(dir string, observer DeployObserver, useLargeMedia, ignoreInstallDirs 
 	return files, err
 }
 
-func addEdgeFunctionsToDeployFiles(dir string, files *deployFiles, observer DeployObserver) error {
+func addInternalFilesToDeploy(dir, internalPath string, files *deployFiles, observer DeployObserver) error {
 	return filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
@@ -629,7 +683,7 @@ func addEdgeFunctionsToDeployFiles(dir string, files *deployFiles, observer Depl
 			if err != nil {
 				return err
 			}
-			rel := edgeFunctionsInternalPath + forceSlashSeparators(osRel)
+			rel := internalPath + forceSlashSeparators(osRel)
 
 			file, err := createFileBundle(rel, path)
 			if err != nil {
@@ -649,9 +703,9 @@ func addEdgeFunctionsToDeployFiles(dir string, files *deployFiles, observer Depl
 	})
 }
 
-func bundle(ctx context.Context, functionDir string, observer DeployObserver) (*deployFiles, []*models.FunctionSchedule, error) {
+func bundle(ctx context.Context, functionDir string, observer DeployObserver) (*deployFiles, []*models.FunctionSchedule, map[string]models.FunctionConfig, error) {
 	if functionDir == "" {
-		return nil, nil, nil
+		return nil, nil, nil, nil
 	}
 
 	manifestFile, err := os.Open(filepath.Join(functionDir, "manifest.json"))
@@ -668,7 +722,7 @@ func bundle(ctx context.Context, functionDir string, observer DeployObserver) (*
 
 	info, err := ioutil.ReadDir(functionDir)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
 	for _, i := range info {
@@ -678,23 +732,23 @@ func bundle(ctx context.Context, functionDir string, observer DeployObserver) (*
 		case zipFile(i):
 			runtime, err := readZipRuntime(filePath)
 			if err != nil {
-				return nil, nil, err
+				return nil, nil, nil, err
 			}
-			file, err := newFunctionFile(filePath, i, runtime, observer)
+			file, err := newFunctionFile(filePath, i, runtime, nil, observer)
 			if err != nil {
-				return nil, nil, err
+				return nil, nil, nil, err
 			}
 			functions.Add(file.Name, file)
 		case jsFile(i):
-			file, err := newFunctionFile(filePath, i, jsRuntime, observer)
+			file, err := newFunctionFile(filePath, i, jsRuntime, nil, observer)
 			if err != nil {
-				return nil, nil, err
+				return nil, nil, nil, err
 			}
 			functions.Add(file.Name, file)
 		case goFile(filePath, i, observer):
-			file, err := newFunctionFile(filePath, i, goRuntime, observer)
+			file, err := newFunctionFile(filePath, i, amazonLinux2, nil, observer)
 			if err != nil {
-				return nil, nil, err
+				return nil, nil, nil, err
 			}
 			functions.Add(file.Name, file)
 		default:
@@ -704,14 +758,14 @@ func bundle(ctx context.Context, functionDir string, observer DeployObserver) (*
 		}
 	}
 
-	return functions, nil, nil
+	return functions, nil, nil, nil
 }
 
-func bundleFromManifest(ctx context.Context, manifestFile *os.File, observer DeployObserver) (*deployFiles, []*models.FunctionSchedule, error) {
+func bundleFromManifest(ctx context.Context, manifestFile *os.File, observer DeployObserver) (*deployFiles, []*models.FunctionSchedule, map[string]models.FunctionConfig, error) {
 	manifestBytes, err := ioutil.ReadAll(manifestFile)
 
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
 	logger := context.GetLogger(ctx)
@@ -722,23 +776,35 @@ func bundleFromManifest(ctx context.Context, manifestFile *os.File, observer Dep
 	err = json.Unmarshal(manifestBytes, &manifest)
 
 	if err != nil {
-		return nil, nil, fmt.Errorf("malformed functions manifest file: %w", err)
+		return nil, nil, nil, fmt.Errorf("malformed functions manifest file: %w", err)
 	}
 
 	schedules := make([]*models.FunctionSchedule, 0, len(manifest.Functions))
 	functions := newDeployFiles()
+	functionsConfig := make(map[string]models.FunctionConfig)
 
 	for _, function := range manifest.Functions {
 		fileInfo, err := os.Stat(function.Path)
 
 		if err != nil {
-			return nil, nil, fmt.Errorf("manifest file specifies a function path that cannot be found: %s", function.Path)
+			return nil, nil, nil, fmt.Errorf("manifest file specifies a function path that cannot be found: %s", function.Path)
 		}
 
-		file, err := newFunctionFile(function.Path, fileInfo, function.Runtime, observer)
+		var runtime string
+		if function.RuntimeVersion != "" {
+			runtime = function.RuntimeVersion
+		} else {
+			runtime = function.Runtime
+		}
+
+		meta := FunctionMetadata{
+			InvocationMode: function.InvocationMode,
+			Timeout:        function.Timeout,
+		}
+		file, err := newFunctionFile(function.Path, fileInfo, runtime, &meta, observer)
 
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 
 		if function.Schedule != "" {
@@ -748,10 +814,61 @@ func bundleFromManifest(ctx context.Context, manifestFile *os.File, observer Dep
 			})
 		}
 
+		routes := make([]*models.FunctionRoute, len(function.Routes))
+		for i, route := range function.Routes {
+			routes[i] = &models.FunctionRoute{
+				Pattern:      route.Pattern,
+				Literal:      route.Literal,
+				Expression:   route.Expression,
+				Methods:      route.Methods,
+				PreferStatic: route.PreferStatic,
+			}
+		}
+
+		excludedRoutes := make([]*models.ExcludedFunctionRoute, len(function.ExcludedRoutes))
+		for i, route := range function.ExcludedRoutes {
+			excludedRoutes[i] = &models.ExcludedFunctionRoute{
+				Pattern:    route.Pattern,
+				Literal:    route.Literal,
+				Expression: route.Expression,
+			}
+		}
+
+		hasConfig := function.DisplayName != "" || function.Generator != "" || len(routes) > 0 || len(excludedRoutes) > 0 || len(function.BuildData) > 0 || function.Priority != 0 || function.TrafficRules != nil || function.Timeout != 0
+		if hasConfig {
+			cfg := models.FunctionConfig{
+				DisplayName:    function.DisplayName,
+				Generator:      function.Generator,
+				Routes:         routes,
+				ExcludedRoutes: excludedRoutes,
+				BuildData:      function.BuildData,
+				Priority:       int64(function.Priority),
+			}
+
+			if function.TrafficRules != nil {
+				cfg.TrafficRules = &models.TrafficRulesConfig{
+					Action: &models.TrafficRulesConfigAction{
+						Type: function.TrafficRules.Action.Type,
+						Config: &models.TrafficRulesConfigActionConfig{
+							Aggregate: function.TrafficRules.Action.Config.Aggregate,
+							RateLimitConfig: &models.TrafficRulesRateLimitConfig{
+								Algorithm:   function.TrafficRules.Action.Config.RateLimitConfig.Algorithm,
+								WindowSize:  int64(function.TrafficRules.Action.Config.RateLimitConfig.WindowSize),
+								WindowLimit: int64(function.TrafficRules.Action.Config.RateLimitConfig.WindowLimit),
+							},
+							To: function.TrafficRules.Action.Config.To,
+						},
+					},
+				}
+			}
+
+			functionsConfig[file.Name] = cfg
+		}
+
 		functions.Add(file.Name, file)
 	}
 
-	return functions, schedules, nil
+	return functions, schedules, functionsConfig, nil
 }
 
 func readZipRuntime(filePath string) (string, error) {
@@ -784,7 +901,7 @@ func readZipRuntime(filePath string) (string, error) {
 	return jsRuntime, nil
 }
 
-func newFunctionFile(filePath string, i os.FileInfo, runtime string, observer DeployObserver) (*FileBundle, error) {
+func newFunctionFile(filePath string, i os.FileInfo, runtime string, metadata *FunctionMetadata, observer DeployObserver) (*FileBundle, error) {
 	file := &FileBundle{
 		Name:    strings.TrimSuffix(i.Name(), filepath.Ext(i.Name())),
 		Runtime: runtime,
@@ -835,6 +952,8 @@ func newFunctionFile(filePath string, i os.FileInfo, runtime string, observer De
 		}
 	}
 
+	file.FunctionMetadata = metadata
+
 	return file, nil
 }
 
@@ -849,7 +968,7 @@ func jsFile(i os.FileInfo) bool {
 func goFile(filePath string, i os.FileInfo, observer DeployObserver) bool {
 	warner, hasWarner := observer.(DeployWarner)
 
-	if m := i.Mode(); m&0111 == 0 { // check if it's an executable file
+	if m := i.Mode(); m&0111 == 0 && runtime.GOOS != "windows" { // check if it's an executable file. skip on windows, since it doesn't have that mode
 		if hasWarner {
 			warner.OnWalkWarning(filePath, "Go binary does not have executable permissions")
 		}
@@ -889,12 +1008,17 @@ func ignoreFile(rel string, ignoreInstallDirs bool) bool {
 }
 
 func createHeader(archive *zip.Writer, i os.FileInfo, runtime string) (io.Writer, error) {
-	if runtime == goRuntime {
+	if runtime == goRuntime || runtime == amazonLinux2 {
 		return archive.CreateHeader(&zip.FileHeader{
 			CreatorVersion: 3 << 8,     // indicates Unix
 			ExternalAttrs:  0777 << 16, // -rwxrwxrwx file permissions
-			Name:           i.Name(),
-			Method:         zip.Deflate,
+
+			// we need to make sure we don't have two ZIP files with the exact same contents - otherwise, our upload deduplication mechanism will do weird things.
+			// adding in the function name as a comment ensures that every function ZIP is unique
+			Comment: i.Name(),
+
+			Name:   "bootstrap",
+			Method: zip.Deflate,
 		})
 	}
 	return archive.Create(i.Name())

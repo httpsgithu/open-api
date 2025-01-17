@@ -46,26 +46,29 @@ func NewGetCurrentUserOK() *GetCurrentUserOK {
 	return &GetCurrentUserOK{}
 }
 
-/*GetCurrentUserOK handles this case with default header values.
+/*
+GetCurrentUserOK handles this case with default header values.
 
 OK
 */
 type GetCurrentUserOK struct {
-	Payload []*models.User
+	Payload *models.User
 }
 
 func (o *GetCurrentUserOK) Error() string {
 	return fmt.Sprintf("[GET /user][%d] getCurrentUserOK  %+v", 200, o.Payload)
 }
 
-func (o *GetCurrentUserOK) GetPayload() []*models.User {
+func (o *GetCurrentUserOK) GetPayload() *models.User {
 	return o.Payload
 }
 
 func (o *GetCurrentUserOK) readResponse(response runtime.ClientResponse, consumer runtime.Consumer, formats strfmt.Registry) error {
 
+	o.Payload = new(models.User)
+
 	// response payload
-	if err := consumer.Consume(response.Body(), &o.Payload); err != nil && err != io.EOF {
+	if err := consumer.Consume(response.Body(), o.Payload); err != nil && err != io.EOF {
 		return err
 	}
 
@@ -79,7 +82,8 @@ func NewGetCurrentUserDefault(code int) *GetCurrentUserDefault {
 	}
 }
 
-/*GetCurrentUserDefault handles this case with default header values.
+/*
+GetCurrentUserDefault handles this case with default header values.
 
 error
 */
