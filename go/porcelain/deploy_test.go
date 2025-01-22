@@ -132,14 +132,61 @@ func TestWaitUntilDeployLive_Timeout(t *testing.T) {
 	}))
 	defer server.Close()
 
-	hu, _ := url.Parse(server.URL)
+	hu, err := url.Parse(server.URL)
+	require.NoError(t, err)
 	tr := apiClient.NewWithClient(hu.Host, "/api/v1", []string{"http"}, http.DefaultClient)
 	client := NewRetryable(tr, strfmt.Default, 1)
 
 	ctx := context.WithAuthInfo(gocontext.Background(), apiClient.BearerToken("token"))
 	ctx, _ = gocontext.WithTimeout(ctx, 50*time.Millisecond)
-	_, err := client.WaitUntilDeployLive(ctx, &models.Deploy{})
+	_, err = client.WaitUntilDeployLive(ctx, &models.Deploy{})
 	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "timed out")
+}
+
+func TestWaitUntilDeployProcessed_Success(t *testing.T) {
+	reqNum := 0
+	server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		reqNum++
+		rw.Header().Set("Content-Type", "application/json; charset=utf-8")
+
+		// validate the polling actually works
+		if reqNum > 1 {
+			rw.Write([]byte(`{ "state": "processed" }`))
+		} else {
+			rw.Write([]byte(`{ "state": "processing" }`))
+		}
+	}))
+	defer server.Close()
+
+	hu, err := url.Parse(server.URL)
+	require.NoError(t, err)
+	tr := apiClient.NewWithClient(hu.Host, "/api/v1", []string{"http"}, http.DefaultClient)
+	client := NewRetryable(tr, strfmt.Default, 1)
+
+	ctx := context.WithAuthInfo(gocontext.Background(), apiClient.BearerToken("token"))
+	ctx, _ = gocontext.WithTimeout(ctx, 30*time.Second)
+	d, err := client.WaitUntilDeployProcessed(ctx, &models.Deploy{})
+	require.NoError(t, err)
+	assert.Equal(t, "processed", d.State)
+}
+
+func TestWaitUntilDeployProcessed_Timeout(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		rw.Header().Set("Content-Type", "application/json; charset=utf-8")
+		rw.Write([]byte(`{ "state": "processing" }`))
+	}))
+	defer server.Close()
+
+	hu, err := url.Parse(server.URL)
+	require.NoError(t, err)
+	tr := apiClient.NewWithClient(hu.Host, "/api/v1", []string{"http"}, http.DefaultClient)
+	client := NewRetryable(tr, strfmt.Default, 1)
+
+	ctx := context.WithAuthInfo(gocontext.Background(), apiClient.BearerToken("token"))
+	ctx, _ = gocontext.WithTimeout(ctx, 50*time.Millisecond)
+	_, err = client.WaitUntilDeployProcessed(ctx, &models.Deploy{})
+	require.Error(t, err)
 	assert.Contains(t, err.Error(), "timed out")
 }
 
@@ -186,7 +233,7 @@ func TestWalk_EdgeFunctions(t *testing.T) {
 	err = ioutil.WriteFile(filepath.Join(edgeFunctionsDir, "123456789.js"), []byte{}, 0644)
 	require.Nil(t, err)
 
-	err = addEdgeFunctionsToDeployFiles(edgeFunctionsDir, files, mockObserver{})
+	err = addInternalFilesToDeploy(edgeFunctionsDir, edgeFunctionsInternalPath, files, mockObserver{})
 	require.Nil(t, err)
 
 	assert.NotNil(t, files.Files[".netlify/internal/edge-functions/manifest.json"])
@@ -194,9 +241,7 @@ func TestWalk_EdgeFunctions(t *testing.T) {
 }
 
 func TestWalk_PublishedFilesAndEdgeFunctions(t *testing.T) {
-	publishDir, err := ioutil.TempDir("", "publish")
-	require.Nil(t, err)
-	defer os.RemoveAll(publishDir)
+	files := setupPublishedAssets(t)
 
 	netlifyDir, err := ioutil.TempDir("", ".netlify")
 	require.Nil(t, err)
@@ -206,6 +251,48 @@ func TestWalk_PublishedFilesAndEdgeFunctions(t *testing.T) {
 	require.Nil(t, err)
 	defer os.RemoveAll(edgeFunctionsDir)
 
+	err = ioutil.WriteFile(filepath.Join(edgeFunctionsDir, "manifest.json"), []byte{}, 0644)
+	require.Nil(t, err)
+	err = ioutil.WriteFile(filepath.Join(edgeFunctionsDir, "123456789.js"), []byte{}, 0644)
+	require.Nil(t, err)
+
+	err = addInternalFilesToDeploy(edgeFunctionsDir, edgeFunctionsInternalPath, files, mockObserver{})
+	require.Nil(t, err)
+
+	assert.NotNil(t, files.Files["assets/styles.css"])
+	assert.NotNil(t, files.Files["index.html"])
+	assert.NotNil(t, files.Files[".netlify/internal/edge-functions/manifest.json"])
+	assert.NotNil(t, files.Files[".netlify/internal/edge-functions/123456789.js"])
+}
+
+func TestWalk_PublishedFilesAndEdgeRedirects(t *testing.T) {
+	files := setupPublishedAssets(t)
+
+	netlifyDir, err := ioutil.TempDir("", ".netlify")
+	require.Nil(t, err)
+	defer os.RemoveAll(netlifyDir)
+
+	edgeRedirectsDir, err := ioutil.TempDir(netlifyDir, "edge-redirects-dist")
+	require.Nil(t, err)
+	defer os.RemoveAll(edgeRedirectsDir)
+
+	err = ioutil.WriteFile(filepath.Join(edgeRedirectsDir, "redirects.json"), []byte{}, 0644)
+	require.Nil(t, err)
+
+	err = addInternalFilesToDeploy(edgeRedirectsDir, edgeRedirectsInternalPath, files, mockObserver{})
+	require.Nil(t, err)
+
+	assert.NotNil(t, files.Files["assets/styles.css"])
+	assert.NotNil(t, files.Files["index.html"])
+	assert.NotNil(t, files.Files[".netlify/deploy-config/redirects.json"])
+}
+
+func setupPublishedAssets(t *testing.T) *deployFiles {
+	publishDir, err := ioutil.TempDir("", "publish")
+	require.Nil(t, err)
+
+	t.Cleanup(func() { os.RemoveAll(publishDir) })
+
 	err = os.Mkdir(filepath.Join(publishDir, "assets"), os.ModePerm)
 	require.Nil(t, err)
 	err = ioutil.WriteFile(filepath.Join(publishDir, "assets", "styles.css"), []byte{}, 0644)
@@ -213,21 +300,10 @@ func TestWalk_PublishedFilesAndEdgeFunctions(t *testing.T) {
 	err = ioutil.WriteFile(filepath.Join(publishDir, "index.html"), []byte{}, 0644)
 	require.Nil(t, err)
 
-	err = ioutil.WriteFile(filepath.Join(edgeFunctionsDir, "manifest.json"), []byte{}, 0644)
-	require.Nil(t, err)
-	err = ioutil.WriteFile(filepath.Join(edgeFunctionsDir, "123456789.js"), []byte{}, 0644)
-	require.Nil(t, err)
-
 	files, err := walk(publishDir, mockObserver{}, false, false)
 	require.Nil(t, err)
 
-	err = addEdgeFunctionsToDeployFiles(edgeFunctionsDir, files, mockObserver{})
-	require.Nil(t, err)
-
-	assert.NotNil(t, files.Files["assets/styles.css"])
-	assert.NotNil(t, files.Files["index.html"])
-	assert.NotNil(t, files.Files[".netlify/internal/edge-functions/manifest.json"])
-	assert.NotNil(t, files.Files[".netlify/internal/edge-functions/123456789.js"])
+	return files
 }
 
 func TestUploadFiles_Cancelation(t *testing.T) {
@@ -258,8 +334,224 @@ func TestUploadFiles_Cancelation(t *testing.T) {
 	for _, bundle := range files.Files {
 		d.Required = append(d.Required, bundle.Sum)
 	}
-	err = client.uploadFiles(ctx, d, files, nil, fileUpload, time.Minute)
+	err = client.uploadFiles(ctx, d, files, nil, fileUpload, time.Minute, false)
 	require.ErrorIs(t, err, gocontext.Canceled)
+}
+
+func TestUploadFiles_Errors(t *testing.T) {
+	ctx := gocontext.Background()
+
+	server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
+		rw.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	hu, _ := url.Parse(server.URL)
+	tr := apiClient.NewWithClient(hu.Host, "/api/v1", []string{"http"}, http.DefaultClient)
+	client := NewRetryable(tr, strfmt.Default, 1)
+	client.uploadLimit = 1
+	ctx = context.WithAuthInfo(ctx, apiClient.BearerToken("token"))
+
+	// Create some files to deploy
+	dir, err := ioutil.TempDir("", "deploy")
+	require.NoError(t, err)
+	defer os.RemoveAll(dir)
+	require.NoError(t, ioutil.WriteFile(filepath.Join(dir, "foo.html"), []byte("Hello"), 0644))
+
+	files, err := walk(dir, nil, false, false)
+	require.NoError(t, err)
+	d := &models.Deploy{}
+	for _, bundle := range files.Files {
+		d.Required = append(d.Required, bundle.Sum)
+	}
+	err = client.uploadFiles(ctx, d, files, nil, fileUpload, time.Minute, false)
+	require.Equal(t, err.Error(), "[PUT /deploys/{deploy_id}/files/{path}][500] uploadDeployFile default  &{Code:0 Message:}")
+}
+
+func TestUploadFiles422Error_SkipsRetry(t *testing.T) {
+	attempts := 0
+	ctx := gocontext.Background()
+
+	server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
+		defer func() {
+			attempts++
+		}()
+
+		rw.Header().Set("Content-Type", "application/json; charset=utf-8")
+		rw.WriteHeader(http.StatusUnprocessableEntity)
+		rw.Write([]byte(`{"message": "Unprocessable Entity", "code": 422 }`))
+	}))
+	defer server.Close()
+
+	// File upload:
+	hu, _ := url.Parse(server.URL)
+	tr := apiClient.NewWithClient(hu.Host, "/api/v1", []string{"http"}, http.DefaultClient)
+	client := NewRetryable(tr, strfmt.Default, 1)
+	client.uploadLimit = 1
+	ctx = context.WithAuthInfo(ctx, apiClient.BearerToken("token"))
+
+	// Create some files to deploy
+	dir, err := ioutil.TempDir("", "deploy")
+	require.NoError(t, err)
+	defer os.RemoveAll(dir)
+	require.NoError(t, ioutil.WriteFile(filepath.Join(dir, "foo.html"), []byte("Hello"), 0644))
+
+	files, err := walk(dir, nil, false, false)
+	require.NoError(t, err)
+	d := &models.Deploy{}
+	for _, bundle := range files.Files {
+		d.Required = append(d.Required, bundle.Sum)
+	}
+	// Set SkipRetry to true
+	err = client.uploadFiles(ctx, d, files, nil, fileUpload, time.Minute, true)
+	require.ErrorContains(t, err, "Code:422 Message:Unprocessable Entity")
+	require.Equal(t, attempts, 1)
+}
+
+func TestUploadFunctions422Error_SkipsRetry(t *testing.T) {
+	attempts := 0
+	ctx := gocontext.Background()
+
+	server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
+		defer func() {
+			attempts++
+		}()
+
+		rw.Header().Set("Content-Type", "application/json; charset=utf-8")
+		rw.WriteHeader(http.StatusUnprocessableEntity)
+		rw.Write([]byte(`{"message": "Unprocessable Entity", "code": 422 }`))
+	}))
+	defer server.Close()
+
+	// Function upload:
+	hu, _ := url.Parse(server.URL)
+	tr := apiClient.NewWithClient(hu.Host, "/api/v1", []string{"http"}, http.DefaultClient)
+	client := NewRetryable(tr, strfmt.Default, 1)
+	client.uploadLimit = 1
+	apiCtx := context.WithAuthInfo(ctx, apiClient.BearerToken("token"))
+
+	dir, err := ioutil.TempDir("", "deploy")
+	functionsPath := filepath.Join(dir, ".netlify", "functions")
+	os.MkdirAll(functionsPath, os.ModePerm)
+	require.NoError(t, err)
+	defer os.RemoveAll(dir)
+	require.NoError(t, ioutil.WriteFile(filepath.Join(functionsPath, "foo.js"), []byte("module.exports = () => {}"), 0644))
+
+	files, _, _, err := bundle(ctx, functionsPath, mockObserver{})
+	require.NoError(t, err)
+	d := &models.Deploy{}
+	for _, bundle := range files.Files {
+		d.RequiredFunctions = append(d.RequiredFunctions, bundle.Sum)
+	}
+	// Set SkipRetry to true
+	err = client.uploadFiles(apiCtx, d, files, nil, functionUpload, time.Minute, true)
+	require.ErrorContains(t, err, "Code:422 Message:Unprocessable Entity")
+	require.Equal(t, attempts, 1)
+}
+
+func TestUploadFiles400Error_NoSkipRetry(t *testing.T) {
+	attempts := 0
+	ctx := gocontext.Background()
+
+	server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
+		defer func() {
+			attempts++
+		}()
+
+		rw.Header().Set("Content-Type", "application/json; charset=utf-8")
+		rw.WriteHeader(http.StatusBadRequest)
+		rw.Write([]byte(`{"message": "Bad Request", "code": 400 }`))
+		return
+	}))
+	defer server.Close()
+
+	hu, _ := url.Parse(server.URL)
+	tr := apiClient.NewWithClient(hu.Host, "/api/v1", []string{"http"}, http.DefaultClient)
+	client := NewRetryable(tr, strfmt.Default, 1)
+	client.uploadLimit = 1
+	ctx = context.WithAuthInfo(ctx, apiClient.BearerToken("token"))
+
+	// Create some files to deploy
+	dir, err := ioutil.TempDir("", "deploy")
+	require.NoError(t, err)
+	defer os.RemoveAll(dir)
+	require.NoError(t, ioutil.WriteFile(filepath.Join(dir, "foo.html"), []byte("Hello"), 0644))
+
+	files, err := walk(dir, nil, false, false)
+	require.NoError(t, err)
+	d := &models.Deploy{}
+	for _, bundle := range files.Files {
+		d.Required = append(d.Required, bundle.Sum)
+	}
+	// Set SkipRetry to false
+	err = client.uploadFiles(ctx, d, files, nil, fileUpload, time.Minute, false)
+	require.ErrorContains(t, err, "Code:400 Message:Bad Request")
+	require.Greater(t, attempts, 1)
+}
+
+func TestUploadFiles_SkipEqualFiles(t *testing.T) {
+	ctx := gocontext.Background()
+
+	serverRequests := 0
+
+	server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		serverRequests++
+
+		rw.Header().Set("Content-Type", "application/json; charset=utf-8")
+		rw.Write([]byte(`{}`))
+	}))
+	defer server.Close()
+
+	hu, _ := url.Parse(server.URL)
+	tr := apiClient.NewWithClient(hu.Host, "/api/v1", []string{"http"}, http.DefaultClient)
+	client := NewRetryable(tr, strfmt.Default, 1)
+	client.uploadLimit = 1
+	ctx = context.WithAuthInfo(ctx, apiClient.BearerToken("token"))
+
+	// Create some files to deploy
+	dir, err := ioutil.TempDir("", "deploy")
+	require.NoError(t, err)
+	defer os.RemoveAll(dir)
+
+	fileBody := []byte("Hello")
+
+	require.NoError(t, ioutil.WriteFile(filepath.Join(dir, "a.html"), fileBody, 0644))
+	require.NoError(t, ioutil.WriteFile(filepath.Join(dir, "b.html"), fileBody, 0644))
+
+	files, err := walk(dir, nil, false, false)
+	require.NoError(t, err)
+
+	// Create some fake function bundles to deploy
+	functionsDir, err := ioutil.TempDir("", "deploy-functions")
+	require.NoError(t, err)
+	defer os.RemoveAll(functionsDir)
+
+	// Get the JS function bundle
+	cwd, _ := os.Getwd()
+	basePath := path.Join(filepath.Dir(cwd), "internal", "data")
+	jsFunctionPath := strings.Replace(filepath.Join(basePath, "hello-js-function-test.zip"), "\\", "/", -1)
+	bundleBody, err := ioutil.ReadFile(jsFunctionPath)
+	require.NoError(t, err)
+
+	require.NoError(t, ioutil.WriteFile(filepath.Join(functionsDir, "a.zip"), bundleBody, 0644))
+	require.NoError(t, ioutil.WriteFile(filepath.Join(functionsDir, "b.zip"), bundleBody, 0644))
+
+	functions, _, _, err := bundle(ctx, functionsDir, mockObserver{})
+	require.NoError(t, err)
+
+	d := &models.Deploy{}
+	// uploadFiles relies on the fact that the list of sums is an array of unique values, as both
+	// the files and bundles have the same SHA we only need one of them for the Required array
+	d.Required = []string{files.Sums["a.html"]}
+	d.RequiredFunctions = []string{functions.Sums["a"]}
+
+	err = client.uploadFiles(ctx, d, files, nil, fileUpload, time.Minute, false)
+	require.NoError(t, err)
+	assert.Equal(t, 1, serverRequests)
+
+	err = client.uploadFiles(ctx, d, functions, nil, functionUpload, time.Minute, false)
+	require.NoError(t, err)
+	assert.Equal(t, 2, serverRequests)
 }
 
 func TestUploadFunctions_RetryCountHeader(t *testing.T) {
@@ -306,30 +598,37 @@ func TestUploadFunctions_RetryCountHeader(t *testing.T) {
 	defer os.RemoveAll(dir)
 	require.NoError(t, ioutil.WriteFile(filepath.Join(functionsPath, "foo.js"), []byte("module.exports = () => {}"), 0644))
 
-	files, _, err := bundle(ctx, functionsPath, mockObserver{})
+	files, _, _, err := bundle(ctx, functionsPath, mockObserver{})
 	require.NoError(t, err)
 	d := &models.Deploy{}
 	for _, bundle := range files.Files {
 		d.RequiredFunctions = append(d.RequiredFunctions, bundle.Sum)
 	}
 
-	require.NoError(t, client.uploadFiles(apiCtx, d, files, nil, functionUpload, time.Minute))
+	require.NoError(t, client.uploadFiles(apiCtx, d, files, nil, functionUpload, time.Minute, false))
 }
 
 func TestBundle(t *testing.T) {
-	functions, schedules, err := bundle(gocontext.Background(), "../internal/data", mockObserver{})
+	functions, schedules, functionsConfig, err := bundle(gocontext.Background(), "../internal/data", mockObserver{})
 
 	assert.Nil(t, err)
-	assert.Equal(t, 3, len(functions.Files))
+	assert.Equal(t, 5, len(functions.Files))
 	assert.Empty(t, schedules)
+	assert.Nil(t, functionsConfig)
 
 	jsFunction := functions.Files["hello-js-function-test"]
 	pyFunction := functions.Files["hello-py-function-test"]
 	rsFunction := functions.Files["hello-rs-function-test"]
+	goFunction := functions.Files["hello-go-binary-function"]
+	goBackgroundFunction := functions.Files["hello-go-binary-function-background"]
 
 	assert.Equal(t, "js", jsFunction.Runtime)
 	assert.Equal(t, "py", pyFunction.Runtime)
 	assert.Equal(t, "rs", rsFunction.Runtime)
+	assert.Equal(t, "provided.al2", goFunction.Runtime)
+	assert.Equal(t, "provided.al2", goBackgroundFunction.Runtime)
+
+	assert.NotEqual(t, goFunction.Sum, goBackgroundFunction.Sum)
 }
 
 func TestBundleWithManifest(t *testing.T) {
@@ -337,6 +636,7 @@ func TestBundleWithManifest(t *testing.T) {
 	basePath := path.Join(filepath.Dir(cwd), "internal", "data")
 	jsFunctionPath := strings.Replace(filepath.Join(basePath, "hello-js-function-test.zip"), "\\", "/", -1)
 	pyFunctionPath := strings.Replace(filepath.Join(basePath, "hello-py-function-test.zip"), "\\", "/", -1)
+	goFunctionPath := strings.Replace(filepath.Join(basePath, "hello-go-binary-function"), "\\", "/", -1)
 	manifestPath := path.Join(basePath, "manifest.json")
 	manifestFile := fmt.Sprintf(`{
 		"functions": [
@@ -344,34 +644,79 @@ func TestBundleWithManifest(t *testing.T) {
 				"path": "%s",
 				"runtime": "a-runtime",
 				"mainFile": "/some/path/hello-js-function-test.js",
+				"displayName": "Hello Javascript Function",
+				"generator": "@netlify/fake-plugin@1.0.0",
+				"timeout": 60,
+				"buildData": { "runtimeAPIVersion": 2 },
 				"name": "hello-js-function-test",
-				"schedule": "* * * * *"
+				"schedule": "* * * * *",
+				"routes": [
+					{
+						"pattern": "/products",
+						"literal": "/products",
+						"prefer_static": true
+					},
+					{
+						"pattern": "/products/:id",
+						"expression": "^/products/(.*)$",
+						"methods": ["GET", "POST"]
+					}
+				]
 			},
 			{
 				"path": "%s",
 				"runtime": "some-other-runtime",
 				"mainFile": "/some/path/hello-py-function-test",
-				"name": "hello-py-function-test"
-			}    
+				"name": "hello-py-function-test",
+				"invocationMode": "stream"
+			},	
+			{
+				"path": "%s",
+				"runtime": "go",
+				"runtimeVersion": "provided.al2",
+				"name": "hello-go-binary-function"
+			}
 		],
 		"version": 1
-	}`, jsFunctionPath, pyFunctionPath)
+	}`, jsFunctionPath, pyFunctionPath, goFunctionPath)
 
 	err := ioutil.WriteFile(manifestPath, []byte(manifestFile), 0644)
 	defer os.Remove(manifestPath)
 	assert.Nil(t, err)
 
-	functions, schedules, err := bundle(gocontext.Background(), "../internal/data", mockObserver{})
-
+	functions, schedules, functionsConfig, err := bundle(gocontext.Background(), "../internal/data", mockObserver{})
 	assert.Nil(t, err)
 
 	assert.Equal(t, 1, len(schedules))
 	assert.Equal(t, "hello-js-function-test", schedules[0].Name)
 	assert.Equal(t, "* * * * *", schedules[0].Cron)
 
-	assert.Equal(t, 2, len(functions.Files))
+	assert.Equal(t, 3, len(functions.Files))
 	assert.Equal(t, "a-runtime", functions.Files["hello-js-function-test"].Runtime)
+	assert.Empty(t, functions.Files["hello-js-function-test"].FunctionMetadata.InvocationMode)
+	assert.Equal(t, int64(60), functions.Files["hello-js-function-test"].FunctionMetadata.Timeout)
 	assert.Equal(t, "some-other-runtime", functions.Files["hello-py-function-test"].Runtime)
+	assert.Equal(t, "stream", functions.Files["hello-py-function-test"].FunctionMetadata.InvocationMode)
+	assert.Equal(t, "provided.al2", functions.Files["hello-go-binary-function"].Runtime)
+	assert.Empty(t, functions.Files["hello-go-binary-function"].FunctionMetadata.InvocationMode)
+
+	helloJSConfig := functionsConfig["hello-js-function-test"]
+
+	assert.Equal(t, 1, len(functionsConfig))
+	assert.Equal(t, "Hello Javascript Function", helloJSConfig.DisplayName)
+	assert.Equal(t, "@netlify/fake-plugin@1.0.0", helloJSConfig.Generator)
+	assert.EqualValues(t, 2, helloJSConfig.BuildData.(map[string]interface{})["runtimeAPIVersion"])
+
+	assert.Equal(t, "/products", helloJSConfig.Routes[0].Pattern)
+	assert.Equal(t, "/products", helloJSConfig.Routes[0].Literal)
+	assert.Empty(t, helloJSConfig.Routes[0].Expression)
+	assert.True(t, helloJSConfig.Routes[0].PreferStatic)
+
+	assert.Equal(t, "/products/:id", helloJSConfig.Routes[1].Pattern)
+	assert.Empty(t, helloJSConfig.Routes[1].Literal)
+	assert.False(t, helloJSConfig.Routes[1].PreferStatic)
+	assert.Equal(t, "^/products/(.*)$", helloJSConfig.Routes[1].Expression)
+	assert.Equal(t, []string{"GET", "POST"}, helloJSConfig.Routes[1].Methods)
 }
 
 func TestReadZipRuntime(t *testing.T) {
